@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿
+using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using YukkuriMovieMaker.Plugin;
@@ -17,6 +18,9 @@ namespace MovingPreviewPlugin
 
         public void SetTimelineToolInfo(TimelineToolInfo info)
         {
+            if (DataContext is MovingPreviewViewModel oldVm)
+                oldVm.Dispose();
+
             var vm = new MovingPreviewViewModel();
             vm.SetTimelineToolInfo(info);
             DataContext = vm;
@@ -24,11 +28,14 @@ namespace MovingPreviewPlugin
 
         private void OnMouseWheel(object sender, MouseWheelEventArgs e)
         {
-            if (DataContext is not MovingPreviewViewModel vm) return;
+            if (DataContext is not MovingPreviewViewModel vm)
+                return;
+
             vm.ZoomAt(
                 e.Delta > 0 ? 1.15 : 1.0 / 1.15,
                 e.GetPosition(RootGrid),
                 new Size(RootGrid.ActualWidth, RootGrid.ActualHeight));
+
             e.Handled = true;
         }
 
@@ -56,25 +63,24 @@ namespace MovingPreviewPlugin
             if (isPanning && DataContext is MovingPreviewViewModel vm)
             {
                 var current = e.GetPosition(this);
+
                 vm.OffsetX += current.X - lastPanPoint.X;
                 vm.OffsetY += current.Y - lastPanPoint.Y;
+
                 lastPanPoint = current;
             }
         }
 
         private void OnResetPosition(object sender, RoutedEventArgs e)
         {
-            if (DataContext is MovingPreviewViewModel vm) vm.ResetView();
+            if (DataContext is MovingPreviewViewModel vm)
+                vm.ResetView();
         }
 
         private void OnToggleLock(object sender, RoutedEventArgs e)
         {
-            if (DataContext is MovingPreviewViewModel vm) vm.ToggleLock();
-        }
-
-        private void OnShowDiagnostics(object sender, RoutedEventArgs e)
-        {
-            if (DataContext is MovingPreviewViewModel vm) vm.ShowItemDiagnostics();
+            if (DataContext is MovingPreviewViewModel vm)
+                vm.ToggleLock();
         }
     }
 }

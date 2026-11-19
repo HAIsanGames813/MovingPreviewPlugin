@@ -1,10 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
+﻿
+using System;
 using System.ComponentModel;
-using System.IO;
-using System.Linq;
-using System.Text;
+using System.Diagnostics;
 using System.Threading;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
@@ -28,47 +27,79 @@ namespace MovingPreviewPlugin
         private double offsetX = 0.0;
         private double offsetY = 0.0;
         private bool isLocked = false;
-        private bool isSelectedOnly = false;
 
         private CancellationTokenSource? cts;
-        private readonly Lock renderLock = new();
+        private Task? renderTask;
+
+        private readonly object renderLoopSync = new();
+        private readonly object renderLock = new();
+
         private double requestedFrame = -1;
-        private bool isDirty = false;
-        private volatile bool _needSourceReset = false;
+        private bool isDirty;
+        private long renderGeneration;
+        private int disposed;
 
-        // -----------------------------------------------------------------------
-        // 公開プロパティ
-        // -----------------------------------------------------------------------
+        public BitmapSource? PreviewImage
+        {
+            get => previewImage;
+            set => Set(ref previewImage, value);
+        }
 
-        public BitmapSource? PreviewImage { get => previewImage; set => Set(ref previewImage, value); }
-        public double Scale { get => scale; set => Set(ref scale, Math.Max(0.05, Math.Min(32.0, value))); }
-        public double OffsetX { get => offsetX; set { if (!isLocked) Set(ref offsetX, value); } }
-        public double OffsetY { get => offsetY; set { if (!isLocked) Set(ref offsetY, value); } }
+        public double Scale
+        {
+            get => scale;
+            set => Set(ref scale, Math.Max(0.05, Math.Min(32.0, value)));
+        }
+
+        public double OffsetX
+        {
+            get => offsetX;
+            set
+            {
+                if (!isLocked)
+                    Set(ref offsetX, value);
+            }
+        }
+
+        public double OffsetY
+        {
+            get => offsetY;
+            set
+            {
+                if (!isLocked)
+                    Set(ref offsetY, value);
+            }
+        }
 
         public bool IsLocked
         {
             get => isLocked;
-            set { if (Set(ref isLocked, value)) OnPropertyChanged(nameof(LockMenuHeader)); }
+            set
+            {
+                if (Set(ref isLocked, value))
+                    OnPropertyChanged(nameof(LockMenuHeader));
+            }
         }
 
-        public bool IsSelectedOnly
-        {
-            get => isSelectedOnly;
-            set { if (Set(ref isSelectedOnly, value)) _needSourceReset = true; }
-        }
-
-        public string LockMenuHeader => isLocked ? "固定を解除" : "固定";
-
-        // -----------------------------------------------------------------------
-        // ITimelineToolViewModel
-        // -----------------------------------------------------------------------
+        public string LockMenuHeader =>
+            isLocked ? "固定を解除" : "固定";
 
         public void SetTimelineToolInfo(TimelineToolInfo info)
         {
-            var newTimeline = info.Timeline;
-            var newScene = info.Scenes.AllScenes.FirstOrDefault(s => s.Timeline == newTimeline);
+            if (Volatile.Read(ref disposed) != 0)
+                return;
 
-            if (!ReferenceEquals(newTimeline, timeline))
+            var newTimeline = info.Timeline;
+            var newScene = info.Scenes.AllScenes
+                .FirstOrDefault(s => s.Timeline == newTimeline);
+
+            bool timelineChanged =
+                !ReferenceEquals(newTimeline, timeline);
+
+            bool sceneChanged =
+                !ReferenceEquals(newScene, scene);
+
+            if (timelineChanged)
             {
                 if (timeline is INotifyPropertyChanged oldNpc)
                     oldNpc.PropertyChanged -= OnTimelinePropertyChanged;
@@ -79,38 +110,62 @@ namespace MovingPreviewPlugin
                     newNpc.PropertyChanged += OnTimelinePropertyChanged;
             }
 
-            if (!ReferenceEquals(newScene, scene))
+            if (timelineChanged || sceneChanged)
             {
                 StopRenderLoop();
+
+                CompositionTarget.Rendering -=
+                    OnCompositionTargetRendering;
+
                 scene = newScene;
 
-                if (scene != null)
+                if (scene != null && timeline != null)
                 {
-                    currentFps = scene.FPS > 0 ? scene.FPS : 60;
-                    StartRenderLoop(scene);
+                    currentFps = scene.FPS > 0
+                        ? scene.FPS
+                        : 60;
 
-                    CompositionTarget.Rendering -= OnCompositionTargetRendering;
-                    CompositionTarget.Rendering += OnCompositionTargetRendering;
+                    StartRenderLoop(
+                        scene,
+                        timeline,
+                        currentFps);
+
+                    CompositionTarget.Rendering +=
+                        OnCompositionTargetRendering;
+                }
+                else
+                {
+                    PreviewImage = null;
                 }
             }
 
             RequestUpdate();
         }
 
-        private void OnCompositionTargetRendering(object? sender, EventArgs e) => RequestUpdate();
-
-        private void OnTimelinePropertyChanged(object? sender, PropertyChangedEventArgs e)
+        private void OnCompositionTargetRendering(
+            object? sender,
+            EventArgs e)
         {
+            RequestUpdate();
+        }
+
+        private void OnTimelinePropertyChanged(
+            object? sender,
+            PropertyChangedEventArgs e)
+        {
+            if (Volatile.Read(ref disposed) != 0)
+                return;
+
             if (string.IsNullOrEmpty(e.PropertyName) ||
-                e.PropertyName is "CurrentFrame" or "Items" or "Length" or "VideoInfo")
+                e.PropertyName is
+                    "CurrentFrame" or
+                    "Items" or
+                    "Length" or
+                    "VideoInfo")
             {
                 RequestUpdate();
             }
         }
-
-        // -----------------------------------------------------------------------
-        // 操作
-        // -----------------------------------------------------------------------
 
         public void ResetView()
         {
@@ -119,89 +174,186 @@ namespace MovingPreviewPlugin
             OffsetY = 0.0;
         }
 
-        public void ToggleLock() => IsLocked = !IsLocked;
-
-        public void ZoomAt(double factor, Point pivot, Size viewSize)
+        public void ToggleLock()
         {
-            if (isLocked) return;
-            double newScale = Math.Max(0.05, Math.Min(32.0, scale * factor));
+            IsLocked = !IsLocked;
+        }
+
+        public void ZoomAt(
+            double factor,
+            Point pivot,
+            Size viewSize)
+        {
+            if (isLocked || scale <= 0)
+                return;
+
+            double newScale = Math.Max(
+                0.05,
+                Math.Min(32.0, scale * factor));
+
             double ratio = newScale / scale;
+
             double cx = viewSize.Width / 2.0;
             double cy = viewSize.Height / 2.0;
-            OffsetX = pivot.X - ratio * (pivot.X - cx - offsetX) - cx;
-            OffsetY = pivot.Y - ratio * (pivot.Y - cy - offsetY) - cy;
+
+            OffsetX =
+                pivot.X -
+                ratio * (pivot.X - cx - offsetX) -
+                cx;
+
+            OffsetY =
+                pivot.Y -
+                ratio * (pivot.Y - cy - offsetY) -
+                cy;
+
             Scale = newScale;
         }
 
-        // -----------------------------------------------------------------------
-        // 診断（YMM4TimelineReader を使って全情報をダンプ）
-        // -----------------------------------------------------------------------
-
-        public void ShowItemDiagnostics()
+        private void StartRenderLoop(
+            YukkuriScene targetScene,
+            YukkuriTimeline targetTimeline,
+            double fps)
         {
-            if (timeline == null) { MessageBox.Show("タイムラインが取得できていません。"); return; }
+            var newCts = new CancellationTokenSource();
+            var token = newCts.Token;
 
-            var snap = YMM4TimelineReader.TakeSnapshot(timeline, includeAllProperties: true);
-            if (snap == null) { MessageBox.Show("スナップショット取得失敗。"); return; }
+            Task? previousTask;
+            long generation;
 
-            var sb = new StringBuilder();
-            sb.AppendLine(YMM4TimelineReader.ToDebugString(snap));
-
-            if (snap.AllItems.Count > 0)
+            lock (renderLoopSync)
             {
-                sb.AppendLine("--- 最初のアイテムの全プロパティ ---");
-                var props = YMM4TimelineReader.GetItemAllProperties(snap.AllItems[0].OriginalItem);
-                foreach (var (k, v) in props)
-                    sb.AppendLine($"  {k} = {v}");
+                previousTask = renderTask;
+                cts = newCts;
+                generation = Interlocked.Increment(
+                    ref renderGeneration);
+
+                renderTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (previousTask != null)
+                        {
+                            try
+                            {
+                                await previousTask.ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine(
+                                    $"[MovingPreviewPlugin] Previous task error: {ex}");
+                            }
+                        }
+
+                        if (token.IsCancellationRequested)
+                            return;
+
+                        RenderWorkerLoop(
+                            targetScene,
+                            targetTimeline,
+                            fps,
+                            token,
+                            generation);
+                    }
+                    catch (OperationCanceledException)
+                        when (token.IsCancellationRequested)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine(
+                            $"[MovingPreviewPlugin] Render task error: {ex}");
+                    }
+                    finally
+                    {
+                        lock (renderLoopSync)
+                        {
+                            if (ReferenceEquals(cts, newCts))
+                                cts = null;
+                        }
+
+                        newCts.Dispose();
+                    }
+                });
             }
-
-            string path = Path.Combine(Path.GetTempPath(), "MovingPreview_ItemDiagnostics.txt");
-            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
-
-            MessageBox.Show(sb.ToString()[..Math.Min(sb.Length, 4000)] + "\n\n...(省略)...\n\nファイルに保存済み:\n" + path,
-                "タイムライン診断", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-
-        // -----------------------------------------------------------------------
-        // バックグラウンド描画ループ
-        // -----------------------------------------------------------------------
-
-        private void StartRenderLoop(YukkuriScene targetScene)
-        {
-            cts = new();
-            var token = cts.Token;
-            Task.Run(() => RenderWorkerLoop(targetScene, token));
         }
 
         private void StopRenderLoop()
         {
-            cts?.Cancel();
-            cts?.Dispose();
-            cts = null;
+            CancellationTokenSource? oldCts;
+
+            lock (renderLoopSync)
+            {
+                Interlocked.Increment(ref renderGeneration);
+
+                oldCts = cts;
+                cts = null;
+
+                if (oldCts != null)
+                {
+                    try
+                    {
+                        oldCts.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
+            }
+
+            lock (renderLock)
+            {
+                isDirty = false;
+                requestedFrame = -1;
+            }
         }
 
         private void RequestUpdate()
         {
-            if (timeline == null) return;
-            lock (renderLock) { requestedFrame = timeline.CurrentFrame; isDirty = true; }
+            if (Volatile.Read(ref disposed) != 0)
+                return;
+
+            var currentTimeline = timeline;
+
+            if (currentTimeline == null)
+                return;
+
+            double frame;
+
+            try
+            {
+                frame = currentTimeline.CurrentFrame;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(
+                    $"[MovingPreviewPlugin] Failed to get current frame: {ex}");
+
+                return;
+            }
+
+            lock (renderLock)
+            {
+                requestedFrame = frame;
+                isDirty = true;
+            }
         }
 
-        private void RenderWorkerLoop(YukkuriScene targetScene, CancellationToken token)
+        private void RenderWorkerLoop(
+            YukkuriScene targetScene,
+            YukkuriTimeline targetTimeline,
+            double fps,
+            CancellationToken token,
+            long generation)
         {
             ITimelineSourceAndDevices? source = null;
+
             try
             {
                 while (!token.IsCancellationRequested)
                 {
-                    if (_needSourceReset)
-                    {
-                        _needSourceReset = false;
-                        source?.Dispose();
-                        source = null;
-                    }
-
                     double frameToRender;
                     bool shouldRender;
+
                     lock (renderLock)
                     {
                         frameToRender = requestedFrame;
@@ -209,78 +361,140 @@ namespace MovingPreviewPlugin
                         isDirty = false;
                     }
 
-                    if (!shouldRender || frameToRender < 0) { Thread.Sleep(8); continue; }
+                    if (!shouldRender || frameToRender < 0)
+                    {
+                        token.WaitHandle.WaitOne(8);
+                        continue;
+                    }
 
-                    source ??= targetScene.TryCreateVideoSource(out var s) ? s : null;
-                    if (source == null) { Thread.Sleep(200); continue; }
+                    if (token.IsCancellationRequested ||
+                        generation != Interlocked.Read(ref renderGeneration))
+                    {
+                        break;
+                    }
+
+                    if (source == null)
+                    {
+                        if (!targetScene.TryCreateVideoSource(out var newSource))
+                        {
+                            token.WaitHandle.WaitOne(200);
+                            continue;
+                        }
+
+                        source = newSource;
+                    }
+
+                    if (source == null)
+                        continue;
 
                     try
                     {
-                        if (currentFps <= 0 || timeline == null || frameToRender >= timeline.Length)
-                            continue;
-
-                        var time = TimeSpan.FromSeconds(frameToRender / currentFps);
-                        List<object>? hidden = null;
-
-                        if (isSelectedOnly)
+                        if (fps <= 0 ||
+                            frameToRender >= targetTimeline.Length)
                         {
-                            // UIスレッドで非選択アイテムを非表示にする
-                            hidden = Application.Current.Dispatcher.Invoke(
-                                () => YMM4TimelineReader.HideNonSelectedItems(timeline));
-
-                            if (hidden.Count > 0)
-                            {
-                                // 変更を描画エンジンに確実に伝えるため source を再生成する
-                                source.Dispose();
-                                source = null;
-                                if (!targetScene.TryCreateVideoSource(out var fresh))
-                                {
-                                    Application.Current.Dispatcher.Invoke(
-                                        () => YMM4TimelineReader.RestoreHiddenItems(hidden));
-                                    continue;
-                                }
-                                source = fresh;
-                            }
+                            continue;
                         }
 
-                        source.Update(time, TimelineSourceUsage.Paused);
+                        var time = TimeSpan.FromSeconds(
+                            frameToRender / fps);
 
-                        // ビットマップを取得してから復元する
+                        source.Update(
+                            time,
+                            TimelineSourceUsage.Paused);
+
                         var bmp = source.RenderBitmapSource();
 
-                        if (hidden != null)
+                        if (bmp == null ||
+                            bmp.PixelWidth <= 0 ||
+                            bmp.PixelHeight <= 0)
                         {
-                            Application.Current.Dispatcher.Invoke(
-                                () => YMM4TimelineReader.RestoreHiddenItems(hidden));
+                            continue;
                         }
 
-                        if (bmp == null || bmp.PixelWidth <= 0) continue;
-
                         bmp.Freeze();
-                        Application.Current.Dispatcher.BeginInvoke(() =>
+
+                        var dispatcher = Application.Current?.Dispatcher;
+
+                        if (dispatcher == null ||
+                            dispatcher.HasShutdownStarted)
                         {
-                            if (!token.IsCancellationRequested) PreviewImage = bmp;
-                        });
+                            continue;
+                        }
+
+                        dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            if (Volatile.Read(ref disposed) != 0)
+                                return;
+
+                            if (token.IsCancellationRequested)
+                                return;
+
+                            if (generation !=
+                                Interlocked.Read(ref renderGeneration))
+                            {
+                                return;
+                            }
+
+                            PreviewImage = bmp;
+                        }));
                     }
-                    catch
+                    catch (OperationCanceledException)
+                        when (token.IsCancellationRequested)
                     {
-                        source?.Dispose();
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine(
+                            $"[MovingPreviewPlugin] Frame rendering error: {ex}");
+
+                        try
+                        {
+                            source?.Dispose();
+                        }
+                        catch (Exception disposeEx)
+                        {
+                            Debug.WriteLine(
+                                $"[MovingPreviewPlugin] Source dispose error: {disposeEx}");
+                        }
+
                         source = null;
+
+                        token.WaitHandle.WaitOne(100);
                     }
                 }
             }
-            catch (OperationCanceledException) { }
-            catch { }
-            finally { source?.Dispose(); }
+            catch (OperationCanceledException)
+                when (token.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(
+                    $"[MovingPreviewPlugin] Fatal render loop error: {ex}");
+            }
+            finally
+            {
+                try
+                {
+                    source?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine(
+                        $"[MovingPreviewPlugin] Final source dispose error: {ex}");
+                }
+            }
         }
-
-        // -----------------------------------------------------------------------
-        // IDisposable
-        // -----------------------------------------------------------------------
 
         public void Dispose()
         {
-            CompositionTarget.Rendering -= OnCompositionTargetRendering;
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+
+            CompositionTarget.Rendering -=
+                OnCompositionTargetRendering;
+
             StopRenderLoop();
 
             if (timeline is INotifyPropertyChanged npc)
@@ -288,6 +502,8 @@ namespace MovingPreviewPlugin
 
             timeline = null;
             scene = null;
+
+            PreviewImage = null;
 
             GC.SuppressFinalize(this);
         }
