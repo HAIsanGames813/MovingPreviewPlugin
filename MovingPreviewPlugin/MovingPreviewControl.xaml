@@ -11,16 +11,20 @@
           MouseLeftButtonUp="OnMouseLeftButtonUp"
           MouseMove="OnMouseMove">
 
-        <!-- 右クリックコンテキストメニュー -->
         <Grid.ContextMenu>
             <ContextMenu>
                 <MenuItem Header="位置をリセット" Click="OnResetPosition"/>
                 <Separator/>
                 <MenuItem Header="{Binding LockMenuHeader}" Click="OnToggleLock"/>
+                <Separator/>
+                <MenuItem Header="選択中のアイテムのみ"
+                          IsCheckable="True"
+                          IsChecked="{Binding IsSelectedOnly}"/>
+                <Separator/>
+                <MenuItem Header="アイテム プロパティ診断..." Click="OnShowDiagnostics"/>
             </ContextMenu>
         </Grid.ContextMenu>
 
-        <!-- プレビュー画像 -->
         <Image Source="{Binding PreviewImage}"
                Stretch="Uniform"
                RenderOptions.BitmapScalingMode="HighQuality"
@@ -33,7 +37,6 @@
             </Image.RenderTransform>
         </Image>
 
-        <!-- 固定中バッジ（右上に小さく表示） -->
         <Border HorizontalAlignment="Right" VerticalAlignment="Top"
                 Margin="0,8,10,0"
                 Background="#CC333333" CornerRadius="3" Padding="5,2"
@@ -49,6 +52,24 @@
                 </Style>
             </Border.Style>
             <TextBlock Text="固定中" Foreground="#FFB347" FontSize="10"
+                       FontWeight="SemiBold" IsHitTestVisible="False"/>
+        </Border>
+
+        <Border HorizontalAlignment="Left" VerticalAlignment="Top"
+                Margin="10,8,0,0"
+                Background="#CC1a3a1a" CornerRadius="3" Padding="5,2"
+                IsHitTestVisible="False">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsSelectedOnly}" Value="True">
+                            <Setter Property="Visibility" Value="Visible"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+            <TextBlock Text="選択中のみ" Foreground="#66FF66" FontSize="10"
                        FontWeight="SemiBold" IsHitTestVisible="False"/>
         </Border>
 

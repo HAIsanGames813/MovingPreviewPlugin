@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -25,11 +28,17 @@ namespace MovingPreviewPlugin
         private double offsetX = 0.0;
         private double offsetY = 0.0;
         private bool isLocked = false;
+        private bool isSelectedOnly = false;
 
         private CancellationTokenSource? cts;
         private readonly Lock renderLock = new();
         private double requestedFrame = -1;
         private bool isDirty = false;
+        private volatile bool _needSourceReset = false;
+
+        // -----------------------------------------------------------------------
+        // 公開プロパティ
+        // -----------------------------------------------------------------------
 
         public BitmapSource? PreviewImage { get => previewImage; set => Set(ref previewImage, value); }
         public double Scale { get => scale; set => Set(ref scale, Math.Max(0.05, Math.Min(32.0, value))); }
@@ -39,14 +48,20 @@ namespace MovingPreviewPlugin
         public bool IsLocked
         {
             get => isLocked;
-            set
-            {
-                if (Set(ref isLocked, value))
-                    OnPropertyChanged(nameof(LockMenuHeader));
-            }
+            set { if (Set(ref isLocked, value)) OnPropertyChanged(nameof(LockMenuHeader)); }
+        }
+
+        public bool IsSelectedOnly
+        {
+            get => isSelectedOnly;
+            set { if (Set(ref isSelectedOnly, value)) _needSourceReset = true; }
         }
 
         public string LockMenuHeader => isLocked ? "固定を解除" : "固定";
+
+        // -----------------------------------------------------------------------
+        // ITimelineToolViewModel
+        // -----------------------------------------------------------------------
 
         public void SetTimelineToolInfo(TimelineToolInfo info)
         {
@@ -82,8 +97,7 @@ namespace MovingPreviewPlugin
             RequestUpdate();
         }
 
-        private void OnCompositionTargetRendering(object? sender, EventArgs e)
-            => RequestUpdate();
+        private void OnCompositionTargetRendering(object? sender, EventArgs e) => RequestUpdate();
 
         private void OnTimelinePropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
@@ -93,6 +107,10 @@ namespace MovingPreviewPlugin
                 RequestUpdate();
             }
         }
+
+        // -----------------------------------------------------------------------
+        // 操作
+        // -----------------------------------------------------------------------
 
         public void ResetView()
         {
@@ -106,21 +124,53 @@ namespace MovingPreviewPlugin
         public void ZoomAt(double factor, Point pivot, Size viewSize)
         {
             if (isLocked) return;
-
             double newScale = Math.Max(0.05, Math.Min(32.0, scale * factor));
             double ratio = newScale / scale;
             double cx = viewSize.Width / 2.0;
             double cy = viewSize.Height / 2.0;
-
             OffsetX = pivot.X - ratio * (pivot.X - cx - offsetX) - cx;
             OffsetY = pivot.Y - ratio * (pivot.Y - cy - offsetY) - cy;
             Scale = newScale;
         }
 
+        // -----------------------------------------------------------------------
+        // 診断（YMM4TimelineReader を使って全情報をダンプ）
+        // -----------------------------------------------------------------------
+
+        public void ShowItemDiagnostics()
+        {
+            if (timeline == null) { MessageBox.Show("タイムラインが取得できていません。"); return; }
+
+            var snap = YMM4TimelineReader.TakeSnapshot(timeline, includeAllProperties: true);
+            if (snap == null) { MessageBox.Show("スナップショット取得失敗。"); return; }
+
+            var sb = new StringBuilder();
+            sb.AppendLine(YMM4TimelineReader.ToDebugString(snap));
+
+            if (snap.AllItems.Count > 0)
+            {
+                sb.AppendLine("--- 最初のアイテムの全プロパティ ---");
+                var props = YMM4TimelineReader.GetItemAllProperties(snap.AllItems[0].OriginalItem);
+                foreach (var (k, v) in props)
+                    sb.AppendLine($"  {k} = {v}");
+            }
+
+            string path = Path.Combine(Path.GetTempPath(), "MovingPreview_ItemDiagnostics.txt");
+            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+
+            MessageBox.Show(sb.ToString()[..Math.Min(sb.Length, 4000)] + "\n\n...(省略)...\n\nファイルに保存済み:\n" + path,
+                "タイムライン診断", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        // -----------------------------------------------------------------------
+        // バックグラウンド描画ループ
+        // -----------------------------------------------------------------------
+
         private void StartRenderLoop(YukkuriScene targetScene)
         {
             cts = new();
-            Task.Run(() => RenderWorkerLoop(targetScene, cts.Token));
+            var token = cts.Token;
+            Task.Run(() => RenderWorkerLoop(targetScene, token));
         }
 
         private void StopRenderLoop()
@@ -133,11 +183,7 @@ namespace MovingPreviewPlugin
         private void RequestUpdate()
         {
             if (timeline == null) return;
-            lock (renderLock)
-            {
-                requestedFrame = timeline.CurrentFrame;
-                isDirty = true;
-            }
+            lock (renderLock) { requestedFrame = timeline.CurrentFrame; isDirty = true; }
         }
 
         private void RenderWorkerLoop(YukkuriScene targetScene, CancellationToken token)
@@ -147,6 +193,13 @@ namespace MovingPreviewPlugin
             {
                 while (!token.IsCancellationRequested)
                 {
+                    if (_needSourceReset)
+                    {
+                        _needSourceReset = false;
+                        source?.Dispose();
+                        source = null;
+                    }
+
                     double frameToRender;
                     bool shouldRender;
                     lock (renderLock)
@@ -156,36 +209,57 @@ namespace MovingPreviewPlugin
                         isDirty = false;
                     }
 
-                    if (!shouldRender || frameToRender < 0)
-                    {
-                        Thread.Sleep(8);
-                        continue;
-                    }
+                    if (!shouldRender || frameToRender < 0) { Thread.Sleep(8); continue; }
 
                     source ??= targetScene.TryCreateVideoSource(out var s) ? s : null;
-                    if (source == null)
-                    {
-                        Thread.Sleep(200);
-                        continue;
-                    }
+                    if (source == null) { Thread.Sleep(200); continue; }
 
                     try
                     {
                         if (currentFps <= 0 || timeline == null || frameToRender >= timeline.Length)
                             continue;
 
-                        source.Update(
-                            TimeSpan.FromSeconds(frameToRender / currentFps),
-                            TimelineSourceUsage.Paused);
+                        var time = TimeSpan.FromSeconds(frameToRender / currentFps);
+                        List<object>? hidden = null;
 
+                        if (isSelectedOnly)
+                        {
+                            // UIスレッドで非選択アイテムを非表示にする
+                            hidden = Application.Current.Dispatcher.Invoke(
+                                () => YMM4TimelineReader.HideNonSelectedItems(timeline));
+
+                            if (hidden.Count > 0)
+                            {
+                                // 変更を描画エンジンに確実に伝えるため source を再生成する
+                                source.Dispose();
+                                source = null;
+                                if (!targetScene.TryCreateVideoSource(out var fresh))
+                                {
+                                    Application.Current.Dispatcher.Invoke(
+                                        () => YMM4TimelineReader.RestoreHiddenItems(hidden));
+                                    continue;
+                                }
+                                source = fresh;
+                            }
+                        }
+
+                        source.Update(time, TimelineSourceUsage.Paused);
+
+                        // ビットマップを取得してから復元する
                         var bmp = source.RenderBitmapSource();
+
+                        if (hidden != null)
+                        {
+                            Application.Current.Dispatcher.Invoke(
+                                () => YMM4TimelineReader.RestoreHiddenItems(hidden));
+                        }
+
                         if (bmp == null || bmp.PixelWidth <= 0) continue;
 
                         bmp.Freeze();
                         Application.Current.Dispatcher.BeginInvoke(() =>
                         {
-                            if (!token.IsCancellationRequested)
-                                PreviewImage = bmp;
+                            if (!token.IsCancellationRequested) PreviewImage = bmp;
                         });
                     }
                     catch
@@ -199,6 +273,10 @@ namespace MovingPreviewPlugin
             catch { }
             finally { source?.Dispose(); }
         }
+
+        // -----------------------------------------------------------------------
+        // IDisposable
+        // -----------------------------------------------------------------------
 
         public void Dispose()
         {
